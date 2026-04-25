@@ -41,10 +41,12 @@
 let parkMode = false;
 let parkMarkers = [];        // all Leaflet layers added in this mode
 let userLocationMarker = null;
+let lastRankedResults = [];   // stored so alternatives can be selected
+let lastUserLat = null;
+let lastUserLng = null;
 
 const OSRM_BASE = 'https://router.project-osrm.org/route/v1/foot';
 const OSRM_TIMEOUT_MS = 9000;
-let nearbyBuildingsCache = [];
 
 // ─── Timeout wrapper (AbortSignal.timeout not universal) ───────────────────
 function timedFetch(url, ms) {
@@ -79,176 +81,47 @@ function nearestWard(lat, lng) {
 // OSRM returns coordinates as [lng, lat]. We sample ~20 evenly-spaced points.
 // A higher score means the road passes through more vulnerable neighborhoods.
 function sampleRouteRisk(coordinates) {
-  const step = Math.max(1, Math.floor(coordinates.length / 25));
-
-  let total = 0;
-  let count = 0;
-
+  const step = Math.max(1, Math.floor(coordinates.length / 20));
+  let total = 0, count = 0;
   for (let i = 0; i < coordinates.length; i += step) {
     const [lng, lat] = coordinates[i];
-
     const w = nearestWard(lat, lng);
-    const wardRisk = w ? w.score : 5.0;
-
-    const densityPenalty = buildingDensityPenalty(lat, lng, 35);
-
-    total += wardRisk + densityPenalty;
-    count++;
+    if (w) { total += w.score; count++; }
   }
-
   return count > 0 ? total / count : 5.0;
 }
 
 // ─── Overpass API — fetch open spaces within radius ────────────────────────
 async function fetchNearbyParks(lat, lng, radiusMeters = 3000) {
   const q = `
-    [out:json][timeout:15];
+    [out:json][timeout:12];
     (
       nwr["leisure"="park"](around:${radiusMeters},${lat},${lng});
+      nwr["leisure"="garden"](around:${radiusMeters},${lat},${lng});
       nwr["landuse"="recreation_ground"](around:${radiusMeters},${lat},${lng});
-      nwr["leisure"="pitch"](around:${radiusMeters},${lat},${lng});
       nwr["leisure"="playground"](around:${radiusMeters},${lat},${lng});
       nwr["landuse"="grass"](around:${radiusMeters},${lat},${lng});
       nwr["landuse"="meadow"](around:${radiusMeters},${lat},${lng});
+      nwr["leisure"="pitch"](around:${radiusMeters},${lat},${lng});
       nwr["leisure"="sports_centre"](around:${radiusMeters},${lat},${lng});
     );
-    out tags center geom;
+    out center;
   `;
-
   const resp = await timedFetch(
     'https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(q),
-    15000
+    12000
   );
-
   if (!resp.ok) throw new Error('Overpass API failed');
-
   const data = await resp.json();
-
   return data.elements
     .map(el => ({
       id: el.id,
       name: el.tags?.name || 'Open Space',
       lat: el.lat ?? el.center?.lat,
       lng: el.lon ?? el.center?.lon,
-      type: el.tags?.leisure || el.tags?.landuse || 'open_space',
-      tags: el.tags || {},
-      geometry: el.geometry || null
+      type: el.tags?.leisure || el.tags?.landuse || 'park',
     }))
-    .filter(p => p.lat && p.lng)
-    .filter(isSafeOpenSpaceCandidate)
-    .filter(p => isLargeEnough(p));
-}
-
-async function fetchNearbyBuildings(lat, lng, radiusMeters = 3000) {
-  const q = `
-    [out:json][timeout:15];
-    (
-      way["building"](around:${radiusMeters},${lat},${lng});
-      relation["building"](around:${radiusMeters},${lat},${lng});
-    );
-    out center;
-  `;
-
-  const resp = await timedFetch(
-    'https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(q),
-    15000
-  );
-
-  if (!resp.ok) return [];
-
-  const data = await resp.json();
-
-  return data.elements
-    .map(el => ({
-      lat: el.lat ?? el.center?.lat,
-      lng: el.lon ?? el.center?.lon
-    }))
-    .filter(b => b.lat && b.lng);
-}
-
-function isSafeOpenSpaceCandidate(space) {
-  const tags = space.tags || {};
-  const type = space.type;
-  const isUnnamed = space.name === 'Open Space';
-
-  // ❌ remove forests / jungle
-  if (tags.natural === 'wood') return false;
-  if (tags.landuse === 'forest') return false;
-  if (tags.landuse === 'orchard') return false;
-  if (tags.landuse === 'scrub') return false;
-
-  // ❌ private
-  if (tags.access === 'private' || tags.access === 'no') return false;
-
-  // ✅ best
-  if (type === 'pitch') return true;
-  if (type === 'recreation_ground') return true;
-
-  // ⚠️ medium
-  if (type === 'grass' || type === 'meadow' || type === 'park') {
-    if (!isUnnamed) return true;
-    space.penalty = 0.2;
-    return true;
-  }
-
-  if (type === 'sports_centre' && !tags.building) return true;
-
-  return false;
-}
-
-function isLargeEnough(space) {
-  if (!space.geometry || space.geometry.length < 3) return true;
-
-  let area = 0;
-  const pts = space.geometry;
-
-  for (let i = 0; i < pts.length - 1; i++) {
-    const p1 = pts[i];
-    const p2 = pts[i + 1];
-    area += (p1.lon * p2.lat - p2.lon * p1.lat);
-  }
-
-  area = Math.abs(area / 2);
-
-  return area > 0.00001; // approx ~800–1000 m²
-}
-
-function getClosestBoundaryPoint(userLat, userLng, geometry) {
-  if (!geometry) return null;
-
-  let best = null;
-  let bestDist = Infinity;
-
-  geometry.forEach(pt => {
-    const d =
-      Math.pow(userLat - pt.lat, 2) +
-      Math.pow(userLng - pt.lon, 2);
-
-    if (d < bestDist) {
-      bestDist = d;
-      best = { lat: pt.lat, lng: pt.lon };
-    }
-  });
-
-  return best;
-}
-
-function buildingDensityPenalty(lat, lng, radiusMeters = 35) {
-  if (!nearbyBuildingsCache.length) return 0;
-
-  let count = 0;
-  const radiusKm = radiusMeters / 1000;
-
-  nearbyBuildingsCache.forEach(b => {
-    const d = haversine(lat, lng, b.lat, b.lng);
-    if (d <= radiusKm) count++;
-  });
-
-  // 0 = open, 3 = very cramped
-  if (count >= 12) return 3.0;
-  if (count >= 8) return 2.0;
-  if (count >= 4) return 1.0;
-  return 0;
+    .filter(p => p.lat && p.lng);
 }
 
 // ─── Deduplicate open spaces (same place as node+way+relation) ─────────────
@@ -294,18 +167,11 @@ async function rankCandidates(userLat, userLng, parks) {
   const results = [];
 
   for (const park of pool) {
-      try {
-        let target = { lat: park.lat, lng: park.lng };
-
-  if (park.geometry) {
-    const edge = getClosestBoundaryPoint(userLat, userLng, park.geometry);
-    if (edge) target = edge;
-  }
-
-const route = await fetchOSRMRoute(userLat, userLng, target.lat, target.lng);
+    try {
+      const route = await fetchOSRMRoute(userLat, userLng, park.lat, park.lng);
       const distKm = route.distance / 1000;
       const avgRisk = sampleRouteRisk(route.geometry.coordinates);
-      results.push({ park, route, distKm, avgRisk, osrmOk: true, target });
+      results.push({ park, route, distKm, avgRisk, osrmOk: true });
     } catch {
       // OSRM unavailable for this leg — use straight-line, neutral risk estimate
       const distKm = haversine(userLat, userLng, park.lat, park.lng);
@@ -317,15 +183,15 @@ const route = await fetchOSRMRoute(userLat, userLng, target.lat, target.lng);
 
   // Normalize metrics across candidates
   const dists = results.map(r => r.distKm);
-  const risks  = results.map(r => r.avgRisk);
+  const risks = results.map(r => r.avgRisk);
   const [minD, maxD] = [Math.min(...dists), Math.max(...dists)];
-  const [minR, maxR] = [Math.min(...risks),  Math.max(...risks)];
+  const [minR, maxR] = [Math.min(...risks), Math.max(...risks)];
 
   results.forEach(r => {
     const nd = maxD > minD ? (r.distKm - minD) / (maxD - minD) : 0;
     const nr = maxR > minR ? (r.avgRisk - minR) / (maxR - minR) : 0;
-    r.composite = 0.90 * nd + 0.10 * nr + (r.park.penalty || 0);   // lower = better
-    r.safetyScore  = Math.round((1 - r.composite) * 100);
+    r.composite = 0.85 * nd + 0.15 * nr;   // lower = better
+    r.safetyScore = Math.round((1 - r.composite) * 100);
   });
 
   return results.sort((a, b) => a.composite - b.composite);
@@ -357,7 +223,7 @@ function drawRouteOnMap(userLat, userLng, result) {
     }).addTo(map);
     parkMarkers.push(line);
 
-    const distKm  = result.distKm.toFixed(2);
+    const distKm = result.distKm.toFixed(2);
     const etaMins = Math.ceil(result.route.duration / 60);
     line.bindTooltip(
       `<span style="font-family:Space Mono;font-size:10px;">
@@ -381,36 +247,36 @@ function drawRouteOnMap(userLat, userLng, result) {
 
 // ─── Corridor risk label (color + text) ────────────────────────────────────
 function corridorRiskLabel(avgRisk) {
-  if (avgRisk >= 7.5) return { text: 'HIGH-RISK CORRIDOR',   color: '#dc2626' };
-  if (avgRisk >= 6.0) return { text: 'MODERATE-RISK ROUTE',  color: '#f97316' };
-  if (avgRisk >= 4.5) return { text: 'LOW-RISK ROUTE',       color: '#ca8a04' };
-  return                    { text: 'SAFE CORRIDOR',          color: '#16a34a' };
+  if (avgRisk >= 7.5) return { text: 'HIGH-RISK CORRIDOR', color: '#dc2626' };
+  if (avgRisk >= 6.0) return { text: 'MODERATE-RISK ROUTE', color: '#f97316' };
+  if (avgRisk >= 4.5) return { text: 'LOW-RISK ROUTE', color: '#ca8a04' };
+  return { text: 'SAFE CORRIDOR', color: '#16a34a' };
 }
 
 // ─── Turn-by-turn direction steps ──────────────────────────────────────────
 const MANEUVER_ICONS = {
-  depart:           '📍',
-  arrive:           '🏁',
-  straight:         '↑',
-  continue:         '↑',
-  'turn-right':     '→',
-  'turn-left':      '←',
+  depart: '📍',
+  arrive: '🏁',
+  straight: '↑',
+  continue: '↑',
+  'turn-right': '→',
+  'turn-left': '←',
   'turn-slight-right': '↗',
-  'turn-slight-left':  '↖',
-  'turn-sharp-right':  '↳',
-  'turn-sharp-left':   '↲',
-  roundabout:       '↻',
-  rotary:           '↻',
-  'fork-right':     '↱',
-  'fork-left':      '↰',
-  'on-ramp-right':  '↱',
-  'on-ramp-left':   '↰',
+  'turn-slight-left': '↖',
+  'turn-sharp-right': '↳',
+  'turn-sharp-left': '↲',
+  roundabout: '↻',
+  rotary: '↻',
+  'fork-right': '↱',
+  'fork-left': '↰',
+  'on-ramp-right': '↱',
+  'on-ramp-left': '↰',
 };
 
 function stepIcon(step) {
   const type = step.maneuver?.type || 'straight';
-  const mod  = step.maneuver?.modifier || '';
-  const key  = mod ? `${type}-${mod}`.replace(/ /g, '-') : type;
+  const mod = step.maneuver?.modifier || '';
+  const key = mod ? `${type}-${mod}`.replace(/ /g, '-') : type;
   return MANEUVER_ICONS[key] || MANEUVER_ICONS[type] || '↑';
 }
 
@@ -422,33 +288,34 @@ function buildDirectionsHTML(steps) {
     <div class="route-section-label">DIRECTIONS</div>
     <div class="route-steps">
       ${usable.map(s => {
-        const dist = s.distance >= 1000
-          ? `${(s.distance / 1000).toFixed(1)} km`
-          : `${Math.round(s.distance)} m`;
-        const name = s.name || 'Continue';
-        return `<div class="route-step">
+    const dist = s.distance >= 1000
+      ? `${(s.distance / 1000).toFixed(1)} km`
+      : `${Math.round(s.distance)} m`;
+    const name = s.name || 'Continue';
+    return `<div class="route-step">
           <span class="step-icon">${stepIcon(s)}</span>
           <span class="step-text">${name}</span>
           <span class="step-dist">${dist}</span>
         </div>`;
-      }).join('')}
+  }).join('')}
     </div>`;
 }
 
-function buildAlternativesHTML(others) {
+function buildAlternativesHTML(others, allRanked) {
   if (!others.length) return '';
   return `
-    <div class="route-section-label" style="margin-top:12px;">ALTERNATIVES</div>
+    <div class="route-section-label" style="margin-top:12px;">ALTERNATIVES · click to route</div>
     ${others.map(r => {
-      const rl = corridorRiskLabel(r.avgRisk);
-      return `<div class="route-alt">
+    const rl = corridorRiskLabel(r.avgRisk);
+    const idx = allRanked.indexOf(r);
+    return `<div class="route-alt route-alt-selectable" data-alt-index="${idx}">
         <div class="route-alt-name">${r.park.name}</div>
         <div class="route-alt-meta">
           <span>${r.distKm.toFixed(2)} km</span>
           <span style="color:${rl.color}">${rl.text}</span>
         </div>
       </div>`;
-    }).join('')}`;
+  }).join('')}`;
 }
 
 // ─── STATUS HELPER ─────────────────────────────────────────────────────────
@@ -456,58 +323,14 @@ function setStatus(msg, color = 'var(--text-muted)') {
   const el = document.getElementById('park-rows');
   if (el) el.innerHTML += `<div class="route-status" style="color:${color}">${msg}</div>`;
 }
-//helper
-async function getAccuratePosition({
-  desiredAccuracy = 80,
-  maxWait = 15000
-} = {}) {
-  return new Promise((resolve, reject) => {
-    if (!navigator.geolocation) {
-      reject(new Error("Geolocation not supported"));
-      return;
-    }
 
-    let best = null;
-
-    const watchId = navigator.geolocation.watchPosition(
-      (pos) => {
-        const acc = pos.coords.accuracy;
-
-        if (!best || acc < best.coords.accuracy) {
-          best = pos;
-          setStatus(`Improving GPS… ±${Math.round(acc)}m`);
-        }
-
-        if (acc <= desiredAccuracy) {
-          navigator.geolocation.clearWatch(watchId);
-          resolve(pos);
-        }
-      },
-      (err) => {
-        navigator.geolocation.clearWatch(watchId);
-        reject(err);
-      },
-      {
-        enableHighAccuracy: true,
-        maximumAge: 0,
-        timeout: 10000
-      }
-    );
-
-    setTimeout(() => {
-      navigator.geolocation.clearWatch(watchId);
-      if (best) resolve(best);
-      else reject(new Error("Unable to get location"));
-    }, maxWait);
-  });
-}
 // ─── MAIN ENTRY POINT ──────────────────────────────────────────────────────
 async function findNearestPark() {
   if (parkMode) { clearPark(); return; }
 
   const parkInfoEl = document.getElementById('park-info');
   const parkRowsEl = document.getElementById('park-rows');
-  const btn        = document.getElementById('park-btn');
+  const btn = document.getElementById('park-btn');
 
   parkInfoEl.classList.add('visible');
   parkRowsEl.innerHTML = '';
@@ -517,46 +340,20 @@ async function findNearestPark() {
   btn.disabled = true;
 
   // ── 1. Acquire user position ──────────────────────────────────────────────
-  let userLat, userLng;
-
-  let pos;
-
+  let userLat, userLng, usingFallback = false;
   try {
-    pos = await getAccuratePosition({
-      desiredAccuracy: 80,
-      maxWait: 15000
+    const pos = await new Promise((resolve, reject) => {
+      if (!navigator.geolocation) reject(new Error('geolocation unavailable'));
+      navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 6000 });
     });
-  } catch (err) {
-    alert("Unable to access your location. Please allow permission.");
-    setStatus("Location access failed", 'var(--high)');
-    finishParkSearch(btn);
-    return;
+    userLat = pos.coords.latitude;
+    userLng = pos.coords.longitude;
+  } catch {
+    const fb = wardMap[10]; // Ward 10 — Baneshwor, highest-risk ward
+    userLat = fb.lat; userLng = fb.lng;
+    usingFallback = true;
+    setStatus('GPS unavailable — using Ward 10 (Baneshwor)', 'var(--high)');
   }
-
-  userLat = pos.coords.latitude;
-  userLng = pos.coords.longitude;
-
-  // Optional: show accuracy circle immediately
-  const accuracy = pos.coords.accuracy;
-
-
-  // Smart zoom (based on accuracy but without circle)
-  const zoom =
-    accuracy < 30 ? 18 :
-    accuracy < 100 ? 17 :
-    accuracy < 300 ? 15 : 13;
-
-  map.setView([userLat, userLng], zoom);
-
-     setStatus('Checking nearby building density…');
-
-     try {
-       nearbyBuildingsCache = await fetchNearbyBuildings(userLat, userLng, 3000);
-       setStatus(`Building density loaded (${nearbyBuildingsCache.length} buildings)`);
-     } catch {
-       nearbyBuildingsCache = [];
-       setStatus('Building density unavailable — using ward risk only', 'var(--high)');
-     }
 
   // User location pin (blue dot)
   if (userLocationMarker) userLocationMarker.remove();
@@ -565,7 +362,7 @@ async function findNearestPark() {
   }).addTo(map);
   userLocationMarker.bindTooltip(
     `<span style="font-family:Space Mono;font-size:10px;">
-       📍 Your Location
+       📍 ${usingFallback ? 'Ward 10 Baneshwor (fallback)' : 'Your Location'}
      </span>`
   );
   parkMarkers.push(userLocationMarker);
@@ -592,79 +389,15 @@ async function findNearestPark() {
     const ranked = await rankCandidates(userLat, userLng, parks);
     if (!ranked.length) throw new Error('Could not compute any routes.');
 
+    // Store for alternative selection
+    lastRankedResults = ranked;
+    lastUserLat = userLat;
+    lastUserLng = userLng;
+
     const best = ranked[0];
 
-    // ── 4. Draw route on map ───────────────────────────────────────────────
-    drawRouteOnMap(userLat, userLng, best);
-
-    // Destination pin (green)
-    const destLat = best.target?.lat ?? best.park.lat;
-    const destLng = best.target?.lng ?? best.park.lng;
-
-    const destPin = L.circleMarker([destLat, destLng], {
-      radius: 13, fillColor: '#16a34a', color: '#ffffff', weight: 3, fillOpacity: 0.95,
-    }).addTo(map);
-    destPin.bindTooltip(
-      `<span style="font-family:Space Mono;font-size:10px;color:#16a34a;">
-         <b>${best.park.name}</b><br>Open Space · ${best.distKm.toFixed(2)} km
-       </span>`,
-      { permanent: true, direction: 'top' }
-    );
-    parkMarkers.push(destPin);
-
-    // Rejected alternatives (smaller, dimmed green pins)
-    ranked.slice(1, 6).forEach(r => {
-      const m = L.circleMarker([r.park.lat, r.park.lng], {
-        radius: 6, fillColor: '#4ade80', color: '#ffffff', weight: 1.5, fillOpacity: 0.4,
-      }).addTo(map);
-      m.bindTooltip(
-        `<span style="font-family:Space Mono;font-size:10px;">${r.park.name} · ${r.distKm.toFixed(2)} km</span>`
-      );
-      parkMarkers.push(m);
-    });
-
-    // ── 5. Build info panel ────────────────────────────────────────────────
-    const rl      = corridorRiskLabel(best.avgRisk);
-    const etaMins = best.route
-      ? Math.ceil(best.route.duration / 60)
-      : Math.ceil(best.distKm / 4.5 * 60); // ~4.5 km/h walking
-    const steps = best.route?.legs?.[0]?.steps || [];
-    const routedCount = ranked.filter(r => r.osrmOk).length;
-
-    parkRowsEl.innerHTML = `
-      <div class="route-dest">
-        <div class="route-dest-name">${best.park.name}</div>
-        <div class="route-dest-type">${best.park.type.toUpperCase().replace(/_/g, ' ')}</div>
-      </div>
-
-      <div class="route-meta-grid">
-        <div class="route-meta-cell">
-          <div class="rmc-val">${best.distKm.toFixed(2)}<span class="rmc-unit">km</span></div>
-          <div class="rmc-label">DISTANCE</div>
-        </div>
-        <div class="route-meta-cell">
-          <div class="rmc-val">~${etaMins}<span class="rmc-unit">min</span></div>
-          <div class="rmc-label">ON FOOT</div>
-        </div>
-        <div class="route-meta-cell">
-          <div class="rmc-val" style="color:${rl.color}">${best.safetyScore}<span class="rmc-unit">%</span></div>
-          <div class="rmc-label">SAFETY</div>
-        </div>
-      </div>
-
-      <div class="route-risk-pill" style="--pill-color:${rl.color};">
-        <span class="pill-dot" style="background:${rl.color};"></span>
-        ${rl.text} &nbsp;·&nbsp; avg corridor risk ${best.avgRisk.toFixed(1)}/10
-      </div>
-
-      <div class="route-algo-note">
-        ⚙ composite = 0.90×distance + 0.10×risk
-        &nbsp;·&nbsp; ${parks.length} spaces &nbsp;·&nbsp; ${routedCount} road-routed
-      </div>
-
-      ${buildDirectionsHTML(steps)}
-      ${buildAlternativesHTML(ranked.slice(1, 5))}
-    `;
+    // ── 4. Draw route + pins + panel ───────────────────────────────────────
+    showSelectedRoute(best, ranked, parks.length);
 
   } catch (err) {
     parkRowsEl.innerHTML = `<div class="route-status" style="color:var(--brand);">⚠ ${err.message}</div>`;
@@ -673,23 +406,120 @@ async function findNearestPark() {
   finishParkSearch(btn);
 }
 
+// ─── Display a chosen route (used by initial pick AND alternative clicks) ──
+function showSelectedRoute(chosen, allRanked, totalSpaces) {
+  const parkRowsEl = document.getElementById('park-rows');
+  const userLat = lastUserLat;
+  const userLng = lastUserLng;
+
+  // Clear previous route lines and pins (keep user location marker)
+  parkMarkers.forEach(m => {
+    if (m !== userLocationMarker) { try { m.remove(); } catch { } }
+  });
+  parkMarkers = parkMarkers.filter(m => m === userLocationMarker);
+
+  // Draw route to chosen destination
+  drawRouteOnMap(userLat, userLng, chosen);
+
+  // Destination pin (green)
+  const destPin = L.circleMarker([chosen.park.lat, chosen.park.lng], {
+    radius: 13, fillColor: '#16a34a', color: '#ffffff', weight: 3, fillOpacity: 0.95,
+  }).addTo(map);
+  destPin.bindTooltip(
+    `<span style="font-family:Space Mono;font-size:10px;color:#16a34a;">
+       <b>${chosen.park.name}</b><br>Open Space · ${chosen.distKm.toFixed(2)} km
+     </span>`,
+    { permanent: true, direction: 'top' }
+  );
+  parkMarkers.push(destPin);
+
+  // Other alternatives (smaller, dimmed green pins)
+  const others = allRanked.filter(r => r !== chosen).slice(0, 5);
+  others.forEach(r => {
+    const m = L.circleMarker([r.park.lat, r.park.lng], {
+      radius: 6, fillColor: '#4ade80', color: '#ffffff', weight: 1.5, fillOpacity: 0.4,
+    }).addTo(map);
+    m.bindTooltip(
+      `<span style="font-family:Space Mono;font-size:10px;">${r.park.name} · ${r.distKm.toFixed(2)} km</span>`
+    );
+    parkMarkers.push(m);
+  });
+
+  // ── Build info panel ──────────────────────────────────────────────────
+  const rl = corridorRiskLabel(chosen.avgRisk);
+  const etaMins = chosen.route
+    ? Math.ceil(chosen.route.duration / 60)
+    : Math.ceil(chosen.distKm / 4.5 * 60);
+  const steps = chosen.route?.legs?.[0]?.steps || [];
+  const routedCount = allRanked.filter(r => r.osrmOk).length;
+  const altList = allRanked.filter(r => r !== chosen).slice(0, 4);
+
+  parkRowsEl.innerHTML = `
+    <div class="route-dest">
+      <div class="route-dest-name">${chosen.park.name}</div>
+      <div class="route-dest-type">${chosen.park.type.toUpperCase().replace(/_/g, ' ')}</div>
+    </div>
+
+    <div class="route-meta-grid">
+      <div class="route-meta-cell">
+        <div class="rmc-val">${chosen.distKm.toFixed(2)}<span class="rmc-unit">km</span></div>
+        <div class="rmc-label">DISTANCE</div>
+      </div>
+      <div class="route-meta-cell">
+        <div class="rmc-val">~${etaMins}<span class="rmc-unit">min</span></div>
+        <div class="rmc-label">ON FOOT</div>
+      </div>
+      <div class="route-meta-cell">
+        <div class="rmc-val" style="color:${rl.color}">${chosen.safetyScore}<span class="rmc-unit">%</span></div>
+        <div class="rmc-label">SAFETY</div>
+      </div>
+    </div>
+
+    <div class="route-risk-pill" style="--pill-color:${rl.color};">
+      <span class="pill-dot" style="background:${rl.color};"></span>
+      ${rl.text} &nbsp;·&nbsp; avg corridor risk ${chosen.avgRisk.toFixed(1)}/10
+    </div>
+
+    <div class="route-algo-note">
+      ⚙ composite = 0.85×distance + 0.15×ward-risk
+      &nbsp;·&nbsp; ${totalSpaces} spaces &nbsp;·&nbsp; ${routedCount} road-routed
+    </div>
+
+    ${buildDirectionsHTML(steps)}
+    ${buildAlternativesHTML(altList, allRanked)}
+  `;
+
+  // Attach click handlers to alternative items
+  document.querySelectorAll('.route-alt-selectable').forEach(el => {
+    el.addEventListener('click', () => {
+      const idx = parseInt(el.dataset.altIndex, 10);
+      if (!isNaN(idx) && lastRankedResults[idx]) {
+        showSelectedRoute(lastRankedResults[idx], lastRankedResults, totalSpaces);
+      }
+    });
+  });
+}
+
 function finishParkSearch(btn) {
   parkMode = true;
   btn = btn || document.getElementById('park-btn');
-  btn.textContent  = '✕ CLEAR ROUTE';
-  btn.disabled     = false;
+  btn.textContent = '✕ CLEAR ROUTE';
+  btn.disabled = false;
   btn.style.borderColor = '#1d6ef5';
-  btn.style.color       = '#1d6ef5';
+  btn.style.color = '#1d6ef5';
 }
 
 function clearPark() {
-  parkMarkers.forEach(m => { try { m.remove(); } catch {} });
+  parkMarkers.forEach(m => { try { m.remove(); } catch { } });
   parkMarkers = [];
-  if (userLocationMarker) { try { userLocationMarker.remove(); } catch {} userLocationMarker = null; }
+  if (userLocationMarker) { try { userLocationMarker.remove(); } catch { } userLocationMarker = null; }
   parkMode = false;
+  lastRankedResults = [];
+  lastUserLat = null;
+  lastUserLng = null;
   document.getElementById('park-info').classList.remove('visible');
   const btn = document.getElementById('park-btn');
-  btn.textContent  = '⬡ Nearest Open Space';
+  btn.textContent = '⬡ Nearest Open Space';
   btn.style.borderColor = '';
-  btn.style.color       = '';
+  btn.style.color = '';
 }
