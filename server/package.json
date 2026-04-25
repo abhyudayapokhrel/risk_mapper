@@ -1,0 +1,15 @@
+{
+  "name": "riskmapper-alert-server",
+  "version": "1.0.0",
+  "description": "RiskMapper Nepal — Earthquake Alert Backend (Web Push + USGS polling)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "generate-vapid": "npx web-push generate-vapid-keys --json"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "web-push": "^3.6.7"
+  }
+}
