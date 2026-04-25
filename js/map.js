@@ -27,7 +27,7 @@ function initMap() {
     maxZoom: 19,
   }).addTo(map);
 
-  fetch('ktm_wards_mapped.geojson')
+  fetch('data/ktm_wards_mapped.geojson')
     .then(r => { if (!r.ok) throw new Error('not found'); return r.json(); })
     .then(geojson => renderGeoJSON(geojson))
     .catch(() => { console.warn('GeoJSON missing — circle markers'); renderCircleMarkers(); });
