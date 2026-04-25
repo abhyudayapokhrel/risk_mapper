@@ -259,10 +259,18 @@ async function showEvacRoutes() {
 
       for (const park of pool) {
         try {
-          const route = await fetchOSRMRoute(src.lat, src.lng, park.lat, park.lng);
+          let target = { lat: park.lat, lng: park.lng };
+
+          if (park.geometry) {
+           const edge = getClosestBoundaryPoint(src.lat, src.lng, park.geometry);
+           if (edge) target = edge;
+          }
+
+          const route = await fetchOSRMRoute(src.lat, src.lng, target.lat, target.lng);
           const distKm = route.distance / 1000;
           const avgRisk = sampleRouteRisk(route.geometry.coordinates);
-          candidates.push({ park, route, distKm, avgRisk, osrmOk: true });
+
+          candidates.push({ park, route, distKm, avgRisk, osrmOk: true, target });
         } catch {
           const distKm = haversine(src.lat, src.lng, park.lat, park.lng);
           candidates.push({ park, route: null, distKm, avgRisk: 5.5, osrmOk: false });
@@ -326,7 +334,7 @@ async function showEvacRoutes() {
                ${riskLabel.text} · Safety ${best.safetyScore}%
              </div>
              <div style="color:#9ba3af;font-size:8px;margin-top:4px;border-top:1px solid #eee;padding-top:4px;">
-               composite = 0.40×dist + 0.60×ward-risk
+               composite = 0.60×distance + 0.40×risk+density
              </div>
            </div>`,
           { sticky: true }
@@ -365,7 +373,10 @@ async function showEvacRoutes() {
       evacuLines.push(srcRing);
 
       // 6. Destination pin (green safe zone)
-      const destPin = L.circleMarker([best.park.lat, best.park.lng], {
+      const destLat = best.target?.lat ?? best.park.lat;
+      const destLng = best.target?.lng ?? best.park.lng;
+
+      const destPin = L.circleMarker([destLat, destLng], {
         radius: 12, fillColor: '#16a34a', color: '#ffffff',
         weight: 3, fillOpacity: 0.95,
       }).addTo(map);
@@ -384,7 +395,10 @@ async function showEvacRoutes() {
 
       // 7. Alternative destinations (smaller, dimmed pins)
       candidates.slice(1, 3).forEach(r => {
-        const m = L.circleMarker([r.park.lat, r.park.lng], {
+        const altLat = r.target?.lat ?? r.park.lat;
+        const altLng = r.target?.lng ?? r.park.lng;
+
+        const m = L.circleMarker([altLat, altLng], {
           radius: 5, fillColor: '#4ade80', color: '#ffffff',
           weight: 1.5, fillOpacity: 0.4,
         }).addTo(map);
